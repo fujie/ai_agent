@@ -5,8 +5,11 @@
  *  - authorization code + PKCE (S256) 必須 / implicit・password グラントなし
  *  - Pushed Authorization Request (RFC 9126) — 図の 10 と 11 に対応
  *  - Client ID Metadata Document によるクライアント識別 (DCR 不要)
+ *    CIMD の取得・検証と信頼ポリシー (許可リスト) の判定は、PAR の時点でこの AS が行う
  *  - Resource Indicators (RFC 8707) — トークンの aud を MCP エンドポイントに限定
  *  - リフレッシュトークンはワンタイム (パブリッククライアント向けのローテーション)
+ *  - `openid` スコープによる本人確認 (ID トークン)。MCP Server が URL モード Elicitation の
+ *    フィッシング対策として「ブラウザの利用者が誰か」を確かめるために使う
  */
 import crypto from 'node:crypto';
 import express from 'express';
@@ -15,6 +18,8 @@ import {
   AS_ISSUER,
   AUTH_CODE_TTL_SEC,
   BASE,
+  BIND_HOST,
+  DEMO_USERS,
   PAR_TTL_SEC,
   PORTS,
   SCOPE,
@@ -40,25 +45,29 @@ interface PushedRequest {
   redirect_uri: string;
   scope: string;
   state: string;
+  nonce?: string;
   code_challenge: string;
   code_challenge_method: 'S256';
-  resource: string;
+  /** 本人確認 (openid のみ) の要求では省略される。 */
+  resource?: string;
   expires_at: number;
 }
 interface AuthCode {
   client_id: string;
   redirect_uri: string;
   scope: string;
-  resource: string;
+  nonce?: string;
+  resource?: string;
   code_challenge: string;
   sub: string;
+  auth_time: number;
   expires_at: number;
   used: boolean;
 }
 interface RefreshToken {
   client_id: string;
   scope: string;
-  resource: string;
+  resource?: string;
   sub: string;
   expires_at: number;
 }
@@ -67,24 +76,49 @@ const pushedRequests = new Map<string, PushedRequest>();
 const authCodes = new Map<string, AuthCode>();
 const refreshTokens = new Map<string, RefreshToken>();
 
-/** このデモではログイン済みのユーザーが 1 人いる前提にする。 */
-const DEMO_USER = { sub: 'user-0001', name: '山田 太郎', email: 'taro@example.com' };
-
 const now = () => Math.floor(Date.now() / 1000);
 const randomId = (bytes = 32) => crypto.randomBytes(bytes).toString('base64url');
+const hasScope = (scope: string, s: string) => scope.split(' ').includes(s);
 
-// ---------------------------------------------------------------- CIMD 解決
+// ---------------------------------------------------------------- ログインセッション
+// デモなのでパスワード認証は省略し、「どのデモユーザーとしてログインするか」を選ぶだけにする。
+// URL モード Elicitation のフィッシング対策 (別のユーザーが連携 URL を開いたら拒否する) を
+// 試せるように、ユーザーを切り替えられるようにしている。
+type DemoUser = (typeof DEMO_USERS)[number];
+const SESSION_COOKIE = 'demo_as_sid';
+const sessions = new Map<string, { sub: string; auth_time: number }>();
+
+function userBySub(sub: string): DemoUser | undefined {
+  return DEMO_USERS.find((u) => u.sub === sub);
+}
+
+function readSession(req: express.Request): { user: DemoUser; auth_time: number } | undefined {
+  const cookie = req.headers.cookie ?? '';
+  const sid = cookie
+    .split(';')
+    .map((c) => c.trim().split('='))
+    .find(([k]) => k === SESSION_COOKIE)?.[1];
+  const session = sid ? sessions.get(sid) : undefined;
+  const user = session ? userBySub(session.sub) : undefined;
+  return user && session ? { user, auth_time: session.auth_time } : undefined;
+}
+
+function startSession(res: express.Response, user: DemoUser): number {
+  const sid = randomId(24);
+  const authTime = now();
+  sessions.set(sid, { sub: user.sub, auth_time: authTime });
+  res.cookie(SESSION_COOKIE, sid, { httpOnly: true, sameSite: 'lax', path: '/' });
+  return authTime;
+}
+
+// ---------------------------------------------------------------- CIMD 解決と信頼ポリシー
 interface ClientMetadata {
   client_id: string;
-  client_name?: string;
+  client_name: string;
   client_uri?: string;
   logo_uri?: string;
   redirect_uris: string[];
-  grant_types?: string[];
-  response_types?: string[];
   scope?: string;
-  policy_uri?: string;
-  tos_uri?: string;
 }
 
 class OAuthError extends Error {
@@ -99,15 +133,13 @@ class OAuthError extends Error {
 
 interface ResolvedClient {
   metadata: ClientMetadata;
-  /** Client registry に登録済みか。 */
   registered: boolean;
-  /** 許可リストに載っているか。 */
   trusted: boolean;
 }
 
 /**
  * client_id (= CIMD の URL) からクライアントメタデータを得る。
- * 取得と検証は Client registry に委譲する。
+ * 取得と検証は Client registry (この AS の台帳) に委譲する。
  */
 async function resolveClient(clientId: string): Promise<ResolvedClient> {
   const res = await fetch(`${BASE.registry}/clients/resolve`, {
@@ -132,13 +164,49 @@ async function resolveClient(clientId: string): Promise<ResolvedClient> {
 }
 
 /**
- * CIMD が正しく取得できても、Client registry に登録されていないクライアントには
- * 認可を与えない。CIMD は「誰を名乗っているか」を示すだけで、
- * 「信頼してよいか」は registry の許可リストが決める。
+ * 認可リクエスト (PAR) を受けた時点で、クライアントを識別して受け入れてよいかを決める。
+ * (以前の図の 6〜8 を、標準どおり AS の中で行う形)
+ *
+ *  a. CIMD を取得・検証する (client_id の URL = クライアントがホストするメタデータ)
+ *  b. 信頼ポリシー (許可リスト) を確認する。CIMD は「誰を名乗っているか」しか示さないので、
+ *     受け入れるかどうかは AS 側の方針で決める
+ *  c. まだ台帳に登録されていなければ登録する
  */
+async function admitClient(clientId: string): Promise<ResolvedClient> {
+  const client = await resolveClient(clientId);
+  log.step('10a', `CIMD を確認しました: ${client.metadata.client_name} (${clientId})`);
+
+  if (!client.trusted) {
+    log.warn(`(10b) 信頼ポリシーに無いクライアントを拒否します: ${clientId}`);
+    throw new OAuthError(
+      'invalid_client',
+      'このクライアントは Client registry に登録されていないため、認可できません',
+      403,
+    );
+  }
+  log.step('10b', '信頼ポリシー (許可リスト) を満たしています');
+
+  if (!client.registered) {
+    const created = await fetch(`${BASE.registry}/clients`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId }),
+    });
+    if (!created.ok) {
+      const err = (await created.json()) as { error_description?: string };
+      throw new OAuthError('invalid_client', err.error_description ?? '登録に失敗しました', 403);
+    }
+    log.step('10c', `クライアントを台帳に登録しました: ${client.metadata.client_name}`);
+    return { ...client, registered: true };
+  }
+  log.step('10c', '既に登録済みのクライアントです');
+  return client;
+}
+
+/** 認可・トークン発行の時点で、登録済みであることを再確認する。 */
 async function requireRegisteredClient(clientId: string): Promise<ResolvedClient> {
   const client = await resolveClient(clientId);
-  if (!client.registered) {
+  if (!client.registered || !client.trusted) {
     log.warn(`未登録のクライアントからの要求を拒否します: ${clientId}`);
     throw new OAuthError(
       'invalid_client',
@@ -149,48 +217,6 @@ async function requireRegisteredClient(clientId: string): Promise<ResolvedClient
   return client;
 }
 
-/** 図の 8: MCP Server からの「クライアント登録（なければ）」。 */
-app.post('/clients/register', async (req, res) => {
-  const clientId: unknown = req.body?.client_id;
-  if (typeof clientId !== 'string') {
-    res.status(400).json({ error: 'invalid_request' });
-    return;
-  }
-  try {
-    const lookup = (await fetch(
-      `${BASE.registry}/clients/lookup?client_id=${encodeURIComponent(clientId)}`,
-    ).then((r) => r.json())) as { registered: boolean };
-
-    if (lookup.registered) {
-      log.step(8, `既に登録済みのクライアントです: ${clientId}`);
-      res.json({ client_id: clientId, registered: true, created: false });
-      return;
-    }
-    const created = await fetch(`${BASE.registry}/clients`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ client_id: clientId }),
-    });
-    if (!created.ok) {
-      const err = (await created.json()) as { error?: string; error_description?: string };
-      // 許可リストに無いクライアントはここで弾かれる。未登録のままなので、
-      // このあと認可リクエスト (PAR) が来ても拒否されることになる。
-      throw new OAuthError(
-        err.error ?? 'invalid_client',
-        err.error_description ?? '登録に失敗しました',
-        created.status === 403 ? 403 : 400,
-      );
-    }
-    log.step(8, `クライアントを登録しました: ${clientId}`);
-    res.status(201).json({ client_id: clientId, registered: true, created: true });
-  } catch (err) {
-    const e = err as OAuthError;
-    res
-      .status(e.status ?? 400)
-      .json({ error: e.code ?? 'invalid_client', error_description: e.message });
-  }
-});
-
 // ---------------------------------------------------------------- メタデータ
 app.get('/.well-known/oauth-authorization-server', (_req, res) => {
   res.json({
@@ -200,7 +226,7 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     pushed_authorization_request_endpoint: `${AS_ISSUER}/par`,
     require_pushed_authorization_requests: true,
     jwks_uri: `${AS_ISSUER}/jwks.json`,
-    scopes_supported: [SCOPE],
+    scopes_supported: [SCOPE, 'openid'],
     response_types_supported: ['code'],
     response_modes_supported: ['query'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
@@ -209,6 +235,9 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     authorization_response_iss_parameter_supported: true,
     // CIMD 対応であることの表明 (client_id に URL を使ってよい)
     client_id_metadata_document_supported: true,
+    // 本人確認 (ID トークン) 用
+    id_token_signing_alg_values_supported: ['RS256'],
+    subject_types_supported: ['public'],
   });
 });
 
@@ -216,9 +245,26 @@ app.get('/jwks.json', (_req, res) => {
   res.json({ keys: [publicJwk] });
 });
 
+/**
+ * トークンや request_uri を含む応答は、中継者やブラウザにキャッシュさせてはならない
+ * (OAuth 2.1 §3.2.3: トークン応答には Cache-Control: no-store が MUST)。
+ */
+function noStore(res: express.Response): void {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Pragma', 'no-cache');
+}
+
 // ---------------------------------------------------------------- PAR (10 → 11)
 app.post('/par', async (req, res) => {
+  noStore(res);
   try {
+    // RFC 9126 §2.1: PAR のリクエストボディは application/x-www-form-urlencoded (MUST)
+    if (!req.is('application/x-www-form-urlencoded')) {
+      throw new OAuthError(
+        'invalid_request',
+        'PAR のリクエストは application/x-www-form-urlencoded で送ってください',
+      );
+    }
     const {
       client_id: clientId,
       redirect_uri: redirectUri,
@@ -227,6 +273,7 @@ app.post('/par', async (req, res) => {
       code_challenge_method: codeChallengeMethod,
       scope = SCOPE,
       state,
+      nonce,
       resource,
     } = req.body ?? {};
 
@@ -239,14 +286,17 @@ app.post('/par', async (req, res) => {
     if (typeof codeChallenge !== 'string' || codeChallenge.length < 43) {
       throw new OAuthError('invalid_request', 'code_challenge が不正です');
     }
-    if (typeof resource !== 'string') {
+    // 本人確認 (openid だけ) の要求はリソースへのアクセスを伴わないので resource は不要。
+    // それ以外 (MCP サーバーへのアクセス) は RFC 8707 の resource を必須にする。
+    const identityOnly = String(scope) === 'openid';
+    if (!identityOnly && typeof resource !== 'string') {
       throw new OAuthError('invalid_target', 'resource (RFC 8707) が必要です');
     }
 
-    log.step(10, `認可リクエスト (PAR) を受け取りました: client_id=${clientId}`);
+    log.step(10, `認可リクエスト (PAR) を受け取りました: client_id=${clientId} scope=${scope}`);
 
-    // CIMD を解決してクライアントを識別し (DCR なし)、登録済みであることを確認する
-    const { metadata } = await requireRegisteredClient(clientId);
+    // CIMD の取得・検証 → 信頼ポリシー → 未登録なら登録
+    const { metadata } = await admitClient(clientId);
 
     // redirect_uri は CIMD の redirect_uris と完全一致であること
     if (!metadata.redirect_uris.includes(redirectUri)) {
@@ -259,9 +309,10 @@ app.post('/par', async (req, res) => {
       redirect_uri: redirectUri,
       scope: String(scope),
       state,
+      nonce: typeof nonce === 'string' ? nonce : undefined,
       code_challenge: codeChallenge,
       code_challenge_method: 'S256',
-      resource,
+      resource: typeof resource === 'string' ? resource : undefined,
       expires_at: now() + PAR_TTL_SEC,
     });
 
@@ -276,23 +327,20 @@ app.post('/par', async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- 認可エンドポイント (13)
+// ---------------------------------------------------------------- 画面
 const esc = (s: string) =>
   s.replace(
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!,
   );
 
-function consentPage(opts: { requestUri: string; metadata: ClientMetadata; pushed: PushedRequest }): string {
-  const { metadata, pushed, requestUri } = opts;
-  return `<!doctype html>
-<html lang="ja"><head><meta charset="utf-8"><title>アクセスの許可 — Demo Authorization Server</title>
-<style>
+const PAGE_STYLE = `
  :root{color-scheme:light dark}
  body{font-family:system-ui,-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif;background:#f4f5f7;margin:0;padding:40px 16px;display:flex;justify-content:center}
  .card{background:#fff;max-width:520px;width:100%;border-radius:14px;box-shadow:0 8px 30px rgba(0,0,0,.09);padding:28px 30px}
  h1{font-size:18px;margin:0 0 4px}
  .sub{color:#666;font-size:13px;margin:0 0 20px}
+ .sub a{color:#4b6bfb;text-decoration:none;margin-left:6px}
  .client{display:flex;gap:12px;align-items:center;border:1px solid #e6e8eb;border-radius:10px;padding:14px;margin-bottom:18px}
  .client img{width:40px;height:40px;border-radius:8px}
  .client b{display:block;font-size:15px}
@@ -302,20 +350,44 @@ function consentPage(opts: { requestUri: string; metadata: ClientMetadata; pushe
  dd{margin:2px 0 0;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
  .scope{display:inline-block;background:#eef2ff;color:#3a49b5;border-radius:6px;padding:3px 8px;font-size:12px;margin-right:6px}
  .note{font-size:11.5px;color:#888;margin-top:18px;line-height:1.6;border-top:1px solid #eee;padding-top:12px}
+ .host{font-weight:700;font-size:13px;font-family:system-ui,sans-serif}
+ .warn{font-size:12px;line-height:1.6;background:#fff7e6;color:#8a5300;border:1px solid #f5d38a;border-radius:8px;padding:9px 11px;margin:14px 0 0}
  .actions{display:flex;gap:10px;margin-top:22px}
  button{flex:1;padding:11px;border-radius:9px;border:0;font-size:14px;cursor:pointer}
  .ok{background:#2f6df6;color:#fff}
  .ng{background:#eceef1;color:#333}
- @media (prefers-color-scheme:dark){body{background:#15171b}.card{background:#1e2127;box-shadow:none}.client{border-color:#31353d}.note{border-color:#2a2e35}.ng{background:#2a2e35;color:#ddd}.scope{background:#26304d;color:#aab8ff}}
-</style></head><body>
+ label.user{display:flex;gap:10px;align-items:center;border:1px solid #e6e8eb;border-radius:10px;padding:12px 14px;margin-top:10px;cursor:pointer;font-size:14px}
+ label.user small{color:#888;display:block;font-size:12px}
+ @media (prefers-color-scheme:dark){body{background:#15171b}.card{background:#1e2127;box-shadow:none}.client,label.user{border-color:#31353d}.note{border-color:#2a2e35}.ng{background:#2a2e35;color:#ddd}.scope{background:#26304d;color:#aab8ff}.warn{background:#3a2c10;color:#f3c97a;border-color:#6b5020}}`;
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+function consentPage(opts: {
+  requestUri: string;
+  metadata: ClientMetadata;
+  pushed: PushedRequest;
+  user: DemoUser;
+  switchUrl: string;
+}): string {
+  const { metadata, pushed, requestUri, user, switchUrl } = opts;
+  // MCP: AS は認可時に戻り先 (redirect URI) のホスト名をはっきり表示しなければならない (MUST)。
+  // 戻り先が localhost だけのクライアントには追加の警告を出すべき (SHOULD)。
+  const redirectHost = new URL(pushed.redirect_uri).host;
+  const localhostOnly = metadata.redirect_uris.every((u) =>
+    LOOPBACK_HOSTS.has(new URL(u).hostname),
+  );
+  return `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>アクセスの許可 — Demo Authorization Server</title>
+<style>${PAGE_STYLE}</style></head><body>
 <div class="card">
   <h1>アクセスを許可しますか？</h1>
-  <p class="sub">${esc(DEMO_USER.name)} (${esc(DEMO_USER.email)}) としてログイン中</p>
+  <p class="sub">${esc(user.name)} (${esc(user.email)}) としてログイン中
+    <a href="${esc(switchUrl)}">ユーザーを切り替える</a></p>
 
   <div class="client">
     ${metadata.logo_uri ? `<img src="${esc(metadata.logo_uri)}" alt="">` : ''}
     <div>
-      <b>${esc(metadata.client_name ?? metadata.client_id)}</b>
+      <b>${esc(metadata.client_name)}</b>
       ${metadata.client_uri ? `<a href="${esc(metadata.client_uri)}" target="_blank" rel="noopener">${esc(metadata.client_uri)}</a>` : ''}
     </div>
   </div>
@@ -327,15 +399,23 @@ function consentPage(opts: { requestUri: string; metadata: ClientMetadata; pushe
       .map((s) => `<span class="scope">${esc(s)}</span>`)
       .join('')}</dd>
     <dt>アクセス先リソース (RFC 8707)</dt>
-    <dd>${esc(pushed.resource)}</dd>
+    <dd>${esc(pushed.resource ?? '(なし)')}</dd>
     <dt>client_id (Client ID Metadata Document)</dt>
     <dd>${esc(pushed.client_id)}</dd>
-    <dt>リダイレクト先</dt>
-    <dd>${esc(pushed.redirect_uri)}</dd>
+    <dt>許可後の戻り先</dt>
+    <dd><span class="host">${esc(redirectHost)}</span> — ${esc(pushed.redirect_uri)}</dd>
   </dl>
+  ${
+    localhostOnly
+      ? `<p class="warn">⚠ 戻り先がこのコンピューター (${esc(redirectHost)}) です。
+         CIMD だけでは localhost の戻り先を名乗る別アプリと区別できません。
+         自分で起動したアプリからの要求であることを確認してください。</p>`
+      : ''
+  }
 
   <form method="post" action="/authorize/decision">
     <input type="hidden" name="request_uri" value="${esc(requestUri)}">
+    <input type="hidden" name="sub" value="${esc(user.sub)}">
     <div class="actions">
       <button class="ng" name="decision" value="deny" type="submit">拒否</button>
       <button class="ok" name="decision" value="allow" type="submit">許可する</button>
@@ -345,6 +425,81 @@ function consentPage(opts: { requestUri: string; metadata: ClientMetadata; pushe
   <p class="note">このクライアント情報は、client_id の URL から取得した
   Client ID Metadata Document に基づいて表示しています。事前のクライアント登録 (DCR) は行っていません。</p>
 </div></body></html>`;
+}
+
+/** ログイン (デモユーザーの選択) 画面。 */
+function sessionPage(opts: { current?: DemoUser; returnTo: string }): string {
+  const users = DEMO_USERS.map(
+    (u, i) => `<label class="user"><input type="radio" name="sub" value="${esc(u.sub)}"
+      ${opts.current ? (opts.current.sub === u.sub ? 'checked' : '') : i === 0 ? 'checked' : ''}>
+      <span>${esc(u.name)}<small>${esc(u.email)} / sub=${esc(u.sub)}</small></span></label>`,
+  ).join('');
+  return `<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><title>ログイン — Demo Authorization Server</title>
+<style>${PAGE_STYLE}</style></head><body>
+<div class="card">
+  <h1>ログイン</h1>
+  <p class="sub">${
+    opts.current ? `現在 ${esc(opts.current.name)} としてログイン中です。` : 'ログインしていません。'
+  } デモのため、ユーザーを選ぶだけでログインできます。</p>
+  <form method="post" action="/session">
+    <input type="hidden" name="return_to" value="${esc(opts.returnTo)}">
+    ${users}
+    <div class="actions"><button class="ok" type="submit">このユーザーでログイン</button></div>
+  </form>
+</div></body></html>`;
+}
+
+/** オープンリダイレクトを避けるため、戻り先は自分の画面 (相対パス) に限る。 */
+function safeReturnTo(value: unknown): string {
+  const s = typeof value === 'string' ? value : '';
+  return s.startsWith('/') && !s.startsWith('//') ? s : '/session';
+}
+
+app.get('/session', (req, res) => {
+  res
+    .type('html')
+    .send(sessionPage({ current: readSession(req)?.user, returnTo: safeReturnTo(req.query.return_to) }));
+});
+
+app.post('/session', (req, res) => {
+  const user = userBySub(String(req.body?.sub ?? ''));
+  if (!user) {
+    res.status(400).send('<p>ユーザーが見つかりません。</p>');
+    return;
+  }
+  startSession(res, user);
+  log.info(`ログイン: ${user.name} (${user.sub})`);
+  res.redirect(302, safeReturnTo(req.body?.return_to));
+});
+
+// ---------------------------------------------------------------- 認可エンドポイント (13)
+/** 認可コードを発行してクライアントへリダイレクトする。 */
+function issueCodeAndRedirect(
+  res: express.Response,
+  pushed: PushedRequest,
+  user: DemoUser,
+  authTime: number,
+): void {
+  const code = randomId(24);
+  authCodes.set(code, {
+    client_id: pushed.client_id,
+    redirect_uri: pushed.redirect_uri,
+    scope: pushed.scope,
+    nonce: pushed.nonce,
+    resource: pushed.resource,
+    code_challenge: pushed.code_challenge,
+    sub: user.sub,
+    auth_time: authTime,
+    expires_at: now() + AUTH_CODE_TTL_SEC,
+    used: false,
+  });
+  const redirect = new URL(pushed.redirect_uri);
+  redirect.searchParams.set('code', code);
+  redirect.searchParams.set('state', pushed.state);
+  redirect.searchParams.set('iss', AS_ISSUER); // RFC 9207
+  log.step(14, `認可コードを発行し、リダイレクトします (user=${user.sub}): ${pushed.redirect_uri}`);
+  res.redirect(302, redirect.toString());
 }
 
 app.get('/authorize', async (req, res) => {
@@ -362,12 +517,40 @@ app.get('/authorize', async (req, res) => {
     res.status(400).send('<p>client_id が request_uri と一致しません。</p>');
     return;
   }
+
+  const here = `/authorize?${new URLSearchParams({ client_id: clientId, request_uri: requestUri })}`;
+  const session = readSession(req);
+
   try {
     const { metadata } = await requireRegisteredClient(clientId);
-    log.step(13, `同意画面を表示します (user=${DEMO_USER.email})`);
-    res.type('html').send(consentPage({ requestUri, metadata, pushed }));
+
+    // 本人確認だけの要求 (scope=openid): ユーザーが誰かを返すだけで、リソースへのアクセスは
+    // 与えない。許可リストに載ったクライアントに限り、ログイン済みなら同意画面を省く。
+    if (pushed.scope === 'openid') {
+      if (!session) {
+        log.info('本人確認の要求ですが、未ログインなのでログイン画面を出します');
+        res.type('html').send(sessionPage({ returnTo: here }));
+        return;
+      }
+      pushedRequests.delete(requestUri);
+      log.step('13', `本人確認: ログイン中のユーザー (${session.user.sub}) を返します`);
+      issueCodeAndRedirect(res, pushed, session.user, session.auth_time);
+      return;
+    }
+
+    const user = session?.user ?? DEMO_USERS[0];
+    log.step(13, `同意画面を表示します (user=${user.email})`);
+    res.type('html').send(
+      consentPage({
+        requestUri,
+        metadata,
+        pushed,
+        user,
+        switchUrl: `/session?${new URLSearchParams({ return_to: here })}`,
+      }),
+    );
   } catch (err) {
-    res.status(400).send(`<p>クライアントを解決できません: ${esc((err as Error).message)}</p>`);
+    res.status(400).send(`<p>クライアントを受け付けられません: ${esc((err as Error).message)}</p>`);
   }
 });
 
@@ -380,31 +563,22 @@ app.post('/authorize/decision', (req, res) => {
   }
   pushedRequests.delete(requestUri); // request_uri はワンタイム
 
-  const redirect = new URL(pushed.redirect_uri);
-  redirect.searchParams.set('state', pushed.state);
-  redirect.searchParams.set('iss', AS_ISSUER); // RFC 9207
-
   if (req.body?.decision !== 'allow') {
     log.step(13, 'ユーザーが拒否しました');
+    const redirect = new URL(pushed.redirect_uri);
     redirect.searchParams.set('error', 'access_denied');
+    redirect.searchParams.set('state', pushed.state);
+    redirect.searchParams.set('iss', AS_ISSUER); // RFC 9207 (エラー応答にも付ける)
     res.redirect(302, redirect.toString());
     return;
   }
 
-  const code = randomId(24);
-  authCodes.set(code, {
-    client_id: pushed.client_id,
-    redirect_uri: pushed.redirect_uri,
-    scope: pushed.scope,
-    resource: pushed.resource,
-    code_challenge: pushed.code_challenge,
-    sub: DEMO_USER.sub,
-    expires_at: now() + AUTH_CODE_TTL_SEC,
-    used: false,
-  });
-  redirect.searchParams.set('code', code);
-  log.step(14, `認可コードを発行し、リダイレクトします: ${pushed.redirect_uri}`);
-  res.redirect(302, redirect.toString());
+  // 同意したユーザーでログインセッションを張る (以後の本人確認はこのセッションを使う)
+  const user = userBySub(String(req.body?.sub ?? '')) ?? readSession(req)?.user ?? DEMO_USERS[0];
+  const existing = readSession(req);
+  const authTime =
+    existing && existing.user.sub === user.sub ? existing.auth_time : startSession(res, user);
+  issueCodeAndRedirect(res, pushed, user, authTime);
 });
 
 // ---------------------------------------------------------------- トークン (15)
@@ -412,22 +586,50 @@ async function issueAccessToken(params: {
   sub: string;
   clientId: string;
   scope: string;
-  resource: string;
+  resource?: string;
 }): Promise<string> {
+  const user = userBySub(params.sub);
+  return (
+    new SignJWT({
+      scope: params.scope,
+      client_id: params.clientId,
+      email: user?.email,
+      name: user?.name,
+    })
+      .setProtectedHeader({ alg: 'RS256', kid: publicJwk.kid!, typ: 'at+jwt' })
+      .setIssuer(AS_ISSUER)
+      .setSubject(params.sub)
+      // RFC 8707: アクセストークンの受け手を MCP エンドポイントに限定する
+      // (本人確認だけの場合はリソースが無いので、受け手は AS 自身にする)
+      .setAudience(params.resource ?? AS_ISSUER)
+      .setIssuedAt()
+      .setExpirationTime(`${TOKEN_TTL_SEC}s`)
+      .setJti(randomId(16))
+      .sign(privateKey)
+  );
+}
+
+/** 本人確認用の ID トークン。受け手 (aud) は要求したクライアントの client_id。 */
+async function issueIdToken(params: {
+  sub: string;
+  clientId: string;
+  nonce?: string;
+  authTime: number;
+}): Promise<string> {
+  const user = userBySub(params.sub);
   return new SignJWT({
-    scope: params.scope,
-    client_id: params.clientId,
-    email: DEMO_USER.email,
-    name: DEMO_USER.name,
+    name: user?.name,
+    email: user?.email,
+    auth_time: params.authTime,
+    // リプレイ防止のため、要求時の nonce をそのまま返す
+    ...(params.nonce && { nonce: params.nonce }),
   })
-    .setProtectedHeader({ alg: 'RS256', kid: publicJwk.kid!, typ: 'at+jwt' })
+    .setProtectedHeader({ alg: 'RS256', kid: publicJwk.kid!, typ: 'JWT' })
     .setIssuer(AS_ISSUER)
     .setSubject(params.sub)
-    // RFC 8707: アクセストークンの受け手を MCP エンドポイントに限定する
-    .setAudience(params.resource)
+    .setAudience(params.clientId)
     .setIssuedAt()
-    .setExpirationTime(`${TOKEN_TTL_SEC}s`)
-    .setJti(randomId(16))
+    .setExpirationTime('5m')
     .sign(privateKey);
 }
 
@@ -439,6 +641,7 @@ function verifyPkce(verifier: string, challenge: string): boolean {
 }
 
 app.post('/token', async (req, res) => {
+  noStore(res);
   try {
     const grantType = req.body?.grant_type;
 
@@ -484,23 +687,34 @@ app.post('/token', async (req, res) => {
         scope: entry.scope,
         resource: entry.resource,
       });
-      const refreshToken = randomId(32);
-      refreshTokens.set(refreshToken, {
-        client_id: entry.client_id,
-        scope: entry.scope,
-        resource: entry.resource,
-        sub: entry.sub,
-        expires_at: now() + 3600,
-      });
-
-      log.step(15, `認可コードをアクセストークンに交換しました (aud=${entry.resource})`);
-      res.json({
+      const body: Record<string, unknown> = {
         access_token: accessToken,
         token_type: 'Bearer',
         expires_in: TOKEN_TTL_SEC,
         scope: entry.scope,
-        refresh_token: refreshToken,
-      });
+      };
+
+      if (hasScope(entry.scope, 'openid')) {
+        body.id_token = await issueIdToken({
+          sub: entry.sub,
+          clientId: entry.client_id,
+          nonce: entry.nonce,
+          authTime: entry.auth_time,
+        });
+        log.info(`本人確認用の ID トークンを発行しました (sub=${entry.sub}, aud=${entry.client_id})`);
+      } else {
+        const refreshToken = randomId(32);
+        refreshTokens.set(refreshToken, {
+          client_id: entry.client_id,
+          scope: entry.scope,
+          resource: entry.resource,
+          sub: entry.sub,
+          expires_at: now() + 3600,
+        });
+        body.refresh_token = refreshToken;
+        log.step(15, `認可コードをアクセストークンに交換しました (aud=${entry.resource})`);
+      }
+      res.json(body);
       return;
     }
 
@@ -543,6 +757,6 @@ app.post('/token', async (req, res) => {
   }
 });
 
-app.listen(PORTS.auth, () => {
-  log.info(`Authorization Server を起動しました: ${AS_ISSUER}`);
+app.listen(PORTS.auth, BIND_HOST, () => {
+  log.info(`Authorization Server を起動しました: ${AS_ISSUER} (bind ${BIND_HOST})`);
 });

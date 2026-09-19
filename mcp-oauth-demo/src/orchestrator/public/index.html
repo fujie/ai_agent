@@ -74,20 +74,29 @@
       .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
       .msg.system { align-self: center; font-size: 12px; color: var(--muted); background: transparent; }
 
-      .elicitation {
-        align-self: flex-start; max-width: 76%; border: 1px solid var(--accent);
-        border-radius: 13px; padding: 16px; background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+      /* URL を開く前にユーザーの同意を求めるカード (自分の認可 / サーバーからの Elicitation) */
+      .card {
+        --tone: var(--accent);
+        align-self: flex-start; max-width: 80%; border: 1px solid var(--tone);
+        border-radius: 13px; padding: 16px; background: color-mix(in srgb, var(--tone) 7%, var(--panel));
       }
-      .elicitation .tag {
-        display: inline-block; font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase;
-        color: var(--accent); border: 1px solid var(--accent); border-radius: 5px; padding: 2px 6px; margin-bottom: 9px;
+      .card.elicit { --tone: #b45309; }
+      .card .tag {
+        display: inline-block; font-size: 10.5px; letter-spacing: .03em;
+        color: var(--tone); border: 1px solid var(--tone); border-radius: 5px; padding: 2px 6px; margin-bottom: 9px;
       }
-      .elicitation p { margin: 0 0 12px; font-size: 14px; line-height: 1.7; }
-      .elicitation a {
-        display: inline-block; background: var(--accent); color: #fff; text-decoration: none;
-        padding: 9px 16px; border-radius: 8px; font-size: 13.5px;
+      .card p { margin: 0 0 10px; font-size: 14px; line-height: 1.7; }
+      .card .from { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+      .card .dest { font-size: 13px; margin: 4px 0 2px; }
+      .card .dest b { font-size: 15px; }
+      .card .warn { font-size: 12px; color: var(--err); margin: 4px 0; }
+      .card code { display: block; margin: 6px 0 12px; font-size: 11px; color: var(--muted); word-break: break-all; }
+      .card .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .card .actions a, .card .actions button {
+        display: inline-block; text-decoration: none; border-radius: 8px; font-size: 13px;
+        padding: 8px 14px; cursor: pointer; border: 1px solid var(--border); background: var(--panel); color: var(--text);
       }
-      .elicitation code { display: block; margin-top: 10px; font-size: 10.5px; color: var(--muted); word-break: break-all; }
+      .card .actions .primary { background: var(--tone); border-color: var(--tone); color: #fff; }
 
       form { display: flex; gap: 10px; padding: 14px 18px; border-top: 1px solid var(--border); background: var(--panel); }
       input[type="text"] {
@@ -131,8 +140,9 @@
       <section id="chat">
         <div id="messages">
           <div class="msg system intro">
-            プロンプトを送ると、LLM が MCP サーバーの hello ツール呼び出しを指示し、
-            OAuth 2.1 の認可フローが始まります。例:「太郎さんに挨拶して」
+            プロンプトを送ると、LLM が MCP サーバーのツール呼び出しを指示し、
+            OAuth 2.1 の認可フローが始まります。
+            例:「太郎さんに挨拶して」(hello) /「パートナー経由で太郎さんに挨拶して」(外部サービス連携 = URL モード Elicitation)
           </div>
         </div>
         <form id="form">
@@ -145,9 +155,10 @@
         <h2>フロー (図の番号に対応)</h2>
         <div id="entries"></div>
         <p class="hint" style="margin-top: 16px">
-          6〜8 (CIMD 確認 / 返却 / クライアント登録) は MCP Server・Client registry・
-          Authorization Server 間で行われます。ターミナルの
-          <code>[mcp]</code> <code>[registry]</code> <code>[auth]</code> のログを見てください。
+          元の図の 6〜8 (CIMD 確認 / 返却 / クライアント登録) は、標準の流れに合わせて
+          10 (認可リクエスト) の中で Authorization Server が行います (<code>[auth]</code> の 10a〜10c)。
+          E5〜E7 (外部サービス連携の本人確認・認可) はブラウザと MCP Server の間で行われます
+          (<code>[mcp]</code> <code>[partner]</code> のログ)。
         </p>
       </aside>
     </main>
@@ -188,23 +199,80 @@
         return el;
       }
 
-      let elicitationEl = null;
+      let authzEl = null;
+      const elicitEls = new Map();
 
-      function addElicitation({ message, url }) {
-        elicitationEl?.remove();
+      /** 開く先のホストを強調し、紛らわしいドメイン (Punycode) には警告を出す。 */
+      function destination(el, host) {
+        el.querySelector('.dest b').textContent = host;
+        if (/(^|\.)xn--/i.test(host)) {
+          el.querySelector('.warn').textContent =
+            '⚠ Punycode を含むドメインです。見た目の似た別サイトでないか確認してください。';
+        }
+      }
+
+      /**
+       * (12) このアプリ自身が MCP サーバーへのアクセス許可を得るための認可 URL。
+       * MCP の Elicitation ではないが、開く前に宛先を示し、ユーザーの操作で開く。
+       */
+      function addAuthorization({ message, url, host }) {
+        authzEl?.remove();
         const el = document.createElement('div');
-        el.className = 'elicitation';
+        el.className = 'card authz';
         el.innerHTML = `
-          <span class="tag">elicitation / url mode</span>
+          <span class="tag">認可 (このアプリ自身のアクセス許可)</span>
           <p></p>
-          <a target="_blank" rel="noopener">ブラウザで認可する</a>
-          <code></code>`;
+          <div class="dest">開く先: <b></b></div><div class="warn"></div>
+          <code></code>
+          <div class="actions"><a class="primary" target="_blank" rel="noopener noreferrer">ブラウザで開いて認可する</a></div>`;
         el.querySelector('p').textContent = message;
-        el.querySelector('a').href = url;
+        destination(el, host);
         el.querySelector('code').textContent = url;
+        el.querySelector('a').href = url;
         messages.appendChild(el);
         messages.scrollTop = messages.scrollHeight;
-        elicitationEl = el;
+        authzEl = el;
+      }
+
+      /**
+       * (E3) MCP サーバーからの URL モード Elicitation。
+       * 仕様どおり、依頼元サーバー・URL 全体・ドメインを示し、ユーザーが同意した場合だけ開く。
+       * URL を事前に読み込んだり、自動で開いたりはしない。
+       */
+      function addElicitation({ id, server, message, url, host }) {
+        const el = document.createElement('div');
+        el.className = 'card elicit';
+        el.innerHTML = `
+          <span class="tag">MCP サーバーからの依頼 · URL モード Elicitation</span>
+          <div class="from">依頼元: <b></b></div>
+          <p></p>
+          <div class="dest">開く先: <b></b></div><div class="warn"></div>
+          <code></code>
+          <div class="actions">
+            <button class="primary" data-action="accept">同意してブラウザで開く</button>
+            <button data-action="decline">拒否</button>
+            <button data-action="cancel">キャンセル</button>
+          </div>`;
+        el.querySelector('.from b').textContent = server;
+        el.querySelector('p').textContent = message;
+        destination(el, host);
+        el.querySelector('code').textContent = url;
+        el.querySelectorAll('button').forEach((btn) =>
+          btn.addEventListener('click', async () => {
+            const action = btn.dataset.action;
+            // 同意したときだけ、ユーザーの操作として URL を開く
+            if (action === 'accept') window.open(url, '_blank', 'noopener,noreferrer');
+            el.querySelectorAll('button').forEach((b) => (b.disabled = true));
+            await fetch(api(`/api/elicitation/${encodeURIComponent(id)}`), {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId, action }),
+            });
+          }),
+        );
+        messages.appendChild(el);
+        messages.scrollTop = messages.scrollHeight;
+        elicitEls.set(id, el);
       }
 
       function addFlow({ step, title, detail, level }) {
@@ -221,9 +289,10 @@
       /** 選択中のオーケストレーターに SSE で繋ぎ直す。 */
       function connect() {
         events?.close();
-        elicitationEl = null;
+        authzEl = null;
+        elicitEls.clear();
         // 画面は接続先の履歴で作り直す (サーバー側が再送してくれる)
-        messages.querySelectorAll('.msg:not(.intro), .elicitation').forEach((el) => el.remove());
+        messages.querySelectorAll('.msg:not(.intro), .card').forEach((el) => el.remove());
         entries.replaceChildren();
 
         events = new EventSource(api(`/api/events?session=${encodeURIComponent(sessionId)}`));
@@ -234,13 +303,21 @@
           // 応答が返ってきたら再び入力できるようにする
           if (role !== 'user') submit.disabled = false;
         });
-        events.addEventListener('elicitation', (e) => {
-          const { params } = JSON.parse(e.data);
-          addElicitation(params);
+        events.addEventListener('authorization-request', (e) => addAuthorization(JSON.parse(e.data)));
+        events.addEventListener('authorization-done', () => {
+          authzEl?.remove();
+          authzEl = null;
         });
-        events.addEventListener('elicitation-done', () => {
-          elicitationEl?.remove();
-          elicitationEl = null;
+        events.addEventListener('elicitation', (e) => addElicitation(JSON.parse(e.data)));
+        events.addEventListener('elicitation-done', (e) => {
+          const { id } = JSON.parse(e.data);
+          if (id) {
+            elicitEls.get(id)?.remove();
+            elicitEls.delete(id);
+          } else {
+            elicitEls.forEach((el) => el.remove());
+            elicitEls.clear();
+          }
         });
       }
 

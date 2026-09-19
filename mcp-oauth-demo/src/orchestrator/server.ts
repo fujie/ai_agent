@@ -1,26 +1,44 @@
 /**
  * オーケストレーター (図の "オーケストレーター (MCP Client / Oauth Client)") と Chat UI。
  *
- * 図の流れをそのまま実装している:
+ * 図の流れを、最新の MCP 仕様に沿う形に整理して実装している:
  *   1. プロンプト指示    : ユーザー → Chat UI
  *   2. 起動              : Chat UI → オーケストレーター
  *   3. 推論指示          : オーケストレーター → LLM
  *   4. MCP Server 呼び出し指示 : LLM → オーケストレーター
  *   5. アクセス試行      : オーケストレーター → MCP Server (トークン無し → 401)
- *   6-8. CIMD 確認 / 返却 / クライアント登録 : MCP Server ↔ Client registry ↔ AS
  *   9. PRM 取得          : オーケストレーター → MCP Server
- *  10. 認可リクエスト    : オーケストレーター → AS (PAR)
+ *  10. 認可リクエスト    : オーケストレーター → AS (PAR)。AS はここで CIMD を取得・検証し、
+ *                          信頼ポリシーを確認して、未登録なら登録する (元の図の 6〜8)
  *  11. 認可 URL を指示   : AS → オーケストレーター (request_uri)
- *  12. Elicitation URL Mode : オーケストレーター → ブラウザ
+ *  12. 認可 URL の提示   : オーケストレーター → ブラウザ (ユーザーの同意を得て開く)
  *  13. 認可              : ユーザー → ブラウザ (同意画面)
  *  14. Callback          : ブラウザ → オーケストレーター (認可コード)
  *  15. 認可コードとトークンを交換 : オーケストレーター → AS
  *  16. リソースアクセス  : オーケストレーター → MCP Server (Bearer 付き)
+ *
+ * 元の図の 12「Elicitation URL Mode」は、MCP 仕様上はクライアント自身の認可には使えない。
+ * そこで 12 は通常の「認可 URL の提示」とし、URL モードの Elicitation は本来の用途
+ * (MCP Server が外部サービスの認可を必要とする場面。partner_hello ツール) で扱う。
+ *   E1. LLM が partner_hello を指示
+ *   E2. MCP Server が input_required (URL モードの Elicitation) を返す
+ *   E3. オーケストレーターが URL を示してユーザーに同意を求める
+ *   E4. 同意を添えて tools/call を再試行 (MRTR)
+ *   E5〜E7. ブラウザでの本人確認と外部サービスの認可、外部 API 呼び出し (MCP Server 側)
  */
+import crypto from 'node:crypto';
 import path from 'node:path';
 import express, { type Response } from 'express';
 import cors from 'cors';
-import { AS_ISSUER, BASE, ORCHESTRATORS, RESOURCE_URI, SCOPE } from '../shared/config.js';
+import {
+  AS_ISSUER,
+  BASE,
+  BIND_HOST,
+  MCP_PROTOCOL_VERSION,
+  ORCHESTRATORS,
+  RESOURCE_URI,
+  SCOPE,
+} from '../shared/config.js';
 import { PROFILE } from './profile.js';
 import { createLogger } from '../shared/log.js';
 import {
@@ -31,10 +49,13 @@ import {
   fetchProtectedResourceMetadata,
   guessResourceMetadataUrls,
   parseWwwAuthenticate,
+  selectScopes,
+  validateAuthorizationResponseIssuer,
   type AuthorizationServerMetadata,
   type TokenSet,
 } from './oauth-client.js';
 import * as mcp from './mcp-client.js';
+import { UnauthorizedError } from '@modelcontextprotocol/client';
 
 const log = createLogger(PROFILE.variant === 'trusted' ? 'orchestrator' : 'orchestrator!');
 const app = express();
@@ -177,6 +198,84 @@ interface PendingAuthorization {
 const pending = new Map<string, PendingAuthorization>();
 const tokens = new TokenStore();
 
+// ------------------------------------------------------------------ URL モード Elicitation (E3 / E4)
+type ElicitAction = 'accept' | 'decline' | 'cancel';
+interface PendingElicitation {
+  sessionId: string;
+  resolve: (action: ElicitAction) => void;
+  timer: NodeJS.Timeout;
+}
+const pendingElicitations = new Map<string, PendingElicitation>();
+
+/**
+ * MCP サーバーから URL モードの Elicitation が来たときの処理 (E3)。
+ *
+ * MCP 仕様がクライアントに求めること:
+ *  - どのサーバーからの依頼かを明示する (MUST)
+ *  - URL 全体を見せ、ユーザーの明示的な同意なしに開かない (MUST / MUST NOT)
+ *  - URL を事前に取得 (プリフェッチ) しない (MUST NOT)
+ *  - ドメインを強調表示する (SHOULD)。拒否・キャンセルをいつでもできる (SHOULD)
+ * このため URL は Chat UI にそのまま示し、ユーザーのボタン操作を待つ。
+ */
+function urlElicitationHandler(sessionId: string): mcp.UrlElicitationHandler {
+  return ({ message, url }) =>
+    new Promise<ElicitAction>((resolve) => {
+      const id = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        pendingElicitations.delete(id);
+        flow(sessionId, { step: 'E3', title: 'Elicitation が時間切れになりました', level: 'warn' });
+        send(sessionId, 'elicitation-done', { id });
+        resolve('cancel');
+      }, 180_000);
+      pendingElicitations.set(id, { sessionId, resolve, timer });
+
+      let host = '(不正な URL)';
+      try {
+        host = new URL(url).host;
+      } catch {
+        /* 不正な URL は UI 側でも開けないように、そのまま表示だけする */
+      }
+      flow(sessionId, {
+        step: 'E3',
+        title: 'MCP サーバーから URL モードの Elicitation を受け取りました',
+        detail: `依頼元=Hello MCP Server / 開く先=${host} — ユーザーの同意を待ちます`,
+      });
+      send(sessionId, 'elicitation', {
+        id,
+        server: 'Hello MCP Server',
+        message,
+        url,
+        host,
+      });
+    });
+}
+
+/** Chat UI からの回答 (同意して開いた / 拒否 / キャンセル)。 */
+app.post('/api/elicitation/:id', (req, res) => {
+  const entry = pendingElicitations.get(req.params.id);
+  const action = req.body?.action as ElicitAction | undefined;
+  if (!entry || entry.sessionId !== req.body?.sessionId) {
+    res.status(404).json({ error: 'この Elicitation は見つかりません' });
+    return;
+  }
+  if (action !== 'accept' && action !== 'decline' && action !== 'cancel') {
+    res.status(400).json({ error: 'action は accept / decline / cancel のいずれかです' });
+    return;
+  }
+  pendingElicitations.delete(req.params.id);
+  clearTimeout(entry.timer);
+  const label = { accept: '同意して URL を開きました', decline: '拒否しました', cancel: 'キャンセルしました' }[action];
+  flow(entry.sessionId, {
+    step: 'E4',
+    title: `ユーザーが${label}`,
+    detail: action === 'accept' ? '同意を添えて tools/call を再試行します (MRTR)。サーバーはブラウザでの連携完了を待ちます' : undefined,
+    level: action === 'accept' ? 'ok' : 'warn',
+  });
+  send(entry.sessionId, 'elicitation-done', { id: req.params.id });
+  entry.resolve(action);
+  res.json({ ok: true });
+});
+
 function callbackPage(message: string, ok: boolean): string {
   return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><title>認可</title>
 <style>body{font-family:system-ui,"Hiragino Sans",sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:#f4f5f7}
@@ -203,11 +302,15 @@ app.get('/oauth/callback', (req, res) => {
   pending.delete(state);
   clearTimeout(entry.timer);
 
-  // RFC 9207: どの AS から返ってきたのかを検証する
-  const iss = req.query.iss ? String(req.query.iss) : undefined;
-  if (iss && iss !== entry.as.issuer) {
-    entry.reject(new Error(`予期しない issuer からの応答です: ${iss}`));
-    res.status(400).type('html').send(callbackPage('issuer が一致しません。', false));
+  // RFC 9207 / MCP 認可仕様: 認可コードをどこかへ送る前に、どの AS から返ってきたかを検証する。
+  // 検証に失敗した場合は error / error_description を表示・利用してはならない (MUST NOT)
+  // ので、エラー応答の処理よりも先に行う。
+  const iss = typeof req.query.iss === 'string' ? req.query.iss : undefined;
+  const issCheck = validateAuthorizationResponseIssuer(entry.as, iss);
+  if (!issCheck.ok) {
+    flow(entry.sessionId, { step: 14, title: 'Callback', detail: issCheck.reason, level: 'error' });
+    entry.reject(new Error(issCheck.reason));
+    res.status(400).type('html').send(callbackPage('認可サーバーの検証に失敗しました。', false));
     return;
   }
 
@@ -234,7 +337,7 @@ app.get('/oauth/callback', (req, res) => {
   flow(entry.sessionId, {
     step: 14,
     title: 'Callback (認可コード)',
-    detail: `code=${code.slice(0, 8)}… / state 検証 OK`,
+    detail: `code=${code.slice(0, 8)}… / state 検証 OK / iss 検証 OK (${iss ?? 'なし'})`,
     level: 'ok',
   });
   entry.resolve(code);
@@ -274,6 +377,10 @@ async function infer(messages: LlmMessage[], tools: mcp.ToolSummary[]): Promise<
  */
 const TOOL_CATALOG: mcp.ToolSummary[] = [
   { name: 'hello', description: '挨拶を返す (hello-mcp-server)' },
+  {
+    name: 'partner_hello',
+    description: '外部サービス (Partner Greeting Service) から挨拶を取得する (hello-mcp-server)',
+  },
 ];
 
 // ------------------------------------------------------------------ トークン取得 (5 → 15)
@@ -289,18 +396,13 @@ async function obtainAccessToken(sessionId: string): Promise<TokenSet> {
     return cached;
   }
 
-  // (5) アクセス試行 — トークン無しで MCP を叩いて 401 を受け取る
+  // (5) アクセス試行 — トークン無しで MCP (server/discover) を叩いて 401 を受け取る
   const probe = await mcp.probeResource();
   flow(sessionId, {
     step: 5,
-    title: 'アクセス試行 (トークン無し)',
+    title: `アクセス試行 (server/discover, MCP ${MCP_PROTOCOL_VERSION}, トークン無し)`,
     detail: `HTTP ${probe.status} / WWW-Authenticate: ${probe.wwwAuthenticate ?? 'なし'}`,
     level: probe.status === 401 ? 'ok' : 'warn',
-  });
-  flow(sessionId, {
-    step: '6-8',
-    title: 'MCP Server による CIMD 確認とクライアント登録',
-    detail: 'MCP Server → Client registry → Authorization Server (各サーバーのログを参照)',
   });
 
   // (9) PRM 取得
@@ -333,20 +435,37 @@ async function obtainAccessToken(sessionId: string): Promise<TokenSet> {
   }
   const issuer = prm.authorization_servers?.[0];
   if (!issuer) throw new Error('PRM に authorization_servers がありません');
+  // トークンは AS ごとに分けて保持する。このリソースの AS がどれかを覚えておく
+  tokens.rememberIssuer(RESOURCE_URI, issuer);
 
+  // AS メタデータ取得 (RFC 8414 → OIDC Discovery の順に探索し、issuer 一致と PKCE 対応を確認)
   const as = await fetchAuthorizationServerMetadata(issuer);
   flow(sessionId, {
     title: 'AS メタデータ取得 (RFC 8414)',
-    detail: `issuer=${as.issuer} / PAR=${as.pushed_authorization_request_endpoint ?? 'なし'} / CIMD対応=${as.client_id_metadata_document_supported ?? false}`,
+    detail:
+      `issuer=${as.issuer} / PKCE=${as.code_challenge_methods_supported?.join(',')} / ` +
+      `PAR=${as.pushed_authorization_request_endpoint ? 'あり' : 'なし'} / ` +
+      `iss 応答=${as.authorization_response_iss_parameter_supported ?? false} / ` +
+      `CIMD 対応=${as.client_id_metadata_document_supported ?? false}`,
     level: 'ok',
   });
+  if (!as.client_id_metadata_document_supported) {
+    // 登録手段の優先順位は 事前登録 → CIMD → DCR。このデモは CIMD しか持たない
+    throw new Error('AS が Client ID Metadata Document に対応していないため、クライアントを識別できません');
+  }
+
+  // スコープの決定 (MCP の Scope Selection Strategy: 401 の scope → PRM の scopes_supported → 省略)
+  const scopes = selectScopes(parsed.scope, prm);
+  const scopeSource = { challenge: '401 の scope', prm: 'PRM の scopes_supported', none: '指定なし' };
 
   // (10) 認可リクエスト → (11) 認可 URL
-  const request = await createAuthorizationRequest(as, { resource: RESOURCE_URI, scope: SCOPE });
+  const request = await createAuthorizationRequest(as, { resource: RESOURCE_URI, scope: scopes.scope });
   flow(sessionId, {
     step: 10,
-    title: '認可リクエスト (PAR)',
-    detail: `client_id=${PROFILE.clientId} / PKCE=S256 / resource=${RESOURCE_URI}`,
+    title: '認可リクエスト (PAR) — AS が CIMD を取得・検証し、信頼ポリシーと登録状況を確認',
+    detail:
+      `client_id=${PROFILE.clientId} / PKCE=S256 / resource=${RESOURCE_URI} / ` +
+      `scope=${scopes.scope ?? '(なし)'} (${scopeSource[scopes.source]})`,
     level: 'ok',
   });
   flow(sessionId, {
@@ -356,7 +475,7 @@ async function obtainAccessToken(sessionId: string): Promise<TokenSet> {
     level: 'ok',
   });
 
-  // (12) Elicitation URL Mode でユーザーに認可を促す
+  // (12) 認可 URL をユーザーに示し、同意を得てブラウザで開いてもらう
   const codePromise = new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => {
       pending.delete(request.state);
@@ -375,17 +494,16 @@ async function obtainAccessToken(sessionId: string): Promise<TokenSet> {
 
   flow(sessionId, {
     step: 12,
-    title: 'Elicitation (URL Mode)',
-    detail: 'ブラウザで認可を依頼します',
+    title: '認可 URL の提示',
+    detail: 'ブラウザで認可サーバーを開いてもらいます (MCP の Elicitation ではなく、クライアント自身の認可)',
   });
-  send(sessionId, 'elicitation', {
-    // MCP の elicitation/create (URL モード) と同じ形で UI に渡す
-    method: 'elicitation/create',
-    params: {
-      mode: 'url',
-      message: 'MCP サーバー (Hello MCP Server) へのアクセスを許可してください。',
-      url: request.authorizationUrl,
-    },
+  // これはこのクライアント自身が MCP サーバーへのアクセス許可を得る手順で、MCP の Elicitation
+  // ではない (URL モードの Elicitation をクライアント自身の認可に使うことは仕様で否定されている)。
+  // ただし URL を開く前に宛先を示して同意を得る、という安全策は同じように取る。
+  send(sessionId, 'authorization-request', {
+    message: 'このアプリが MCP サーバー (Hello MCP Server) にアクセスする許可を求めています。',
+    url: request.authorizationUrl,
+    host: new URL(request.authorizationUrl).host,
   });
 
   // (13) ユーザーがブラウザで認可 → (14) Callback で code を受け取る
@@ -396,16 +514,45 @@ async function obtainAccessToken(sessionId: string): Promise<TokenSet> {
     code,
     verifier: request.pkce.verifier,
     resource: request.resource,
+    scope: request.scope,
   });
   tokens.set(sessionId, token);
   flow(sessionId, {
     step: 15,
     title: '認可コードとトークンを交換',
-    detail: `scope=${token.scope} / 有効期限=${new Date(token.expires_at * 1000).toLocaleTimeString('ja-JP')}`,
+    detail: `issuer=${token.issuer} / scope=${token.scope ?? '(なし)'} / 有効期限=${new Date(token.expires_at * 1000).toLocaleTimeString('ja-JP')}`,
     level: 'ok',
   });
-  send(sessionId, 'elicitation-done', {});
+  send(sessionId, 'authorization-done', {});
   return token;
+}
+
+/** MCP サーバーがトークンを 401 で拒否したか (期限切れ・AS の鍵が変わった等)。 */
+function isUnauthorized(err: unknown): boolean {
+  if (UnauthorizedError.isInstance(err)) return true;
+  const e = err as { status?: number; code?: number; data?: { status?: number } } | undefined;
+  return e?.status === 401 || e?.data?.status === 401;
+}
+
+/**
+ * アクセストークンを用意して MCP に接続する。
+ * 手元のトークンが 401 で拒否された場合は、MCP 認可仕様どおり破棄して認可をやり直す (1 回だけ)。
+ */
+async function connectWithToken(sessionId: string): Promise<mcp.McpSession> {
+  const token = await obtainAccessToken(sessionId);
+  try {
+    return await mcp.connect(token.access_token, urlElicitationHandler(sessionId));
+  } catch (err) {
+    if (!isUnauthorized(err)) throw err;
+    flow(sessionId, {
+      title: 'トークンが拒否されました (401)',
+      detail: '手元のトークンを破棄して、認可をやり直します',
+      level: 'warn',
+    });
+    tokens.clear(sessionId, RESOURCE_URI);
+    const fresh = await obtainAccessToken(sessionId);
+    return mcp.connect(fresh.access_token, urlElicitationHandler(sessionId));
+  }
 }
 
 // ------------------------------------------------------------------ チャット本体
@@ -428,23 +575,21 @@ async function runChat(sessionId: string, prompt: string): Promise<void> {
   }
 
   const call = decision.tool_calls[0];
+  const isPartner = call.name === 'partner_hello';
   flow(sessionId, {
-    step: 4,
-    title: 'MCP Server 呼び出し指示',
+    step: isPartner ? '4 / E1' : 4,
+    title: isPartner ? 'MCP Server 呼び出し指示 (外部サービス連携が必要なツール)' : 'MCP Server 呼び出し指示',
     detail: `${call.name}(${JSON.stringify(call.arguments)})`,
     level: 'ok',
   });
 
-  // (5)〜(15) 必要ならアクセストークンを取得
-  const token = await obtainAccessToken(sessionId);
-
-  // (16) リソースアクセス
-  const session = await mcp.connect(token.access_token);
+  // (5)〜(15) 必要ならアクセストークンを取得し、(16) Bearer 付きで MCP に接続する
+  const session = await connectWithToken(sessionId);
   try {
     const tools = await mcp.listTools(session);
     flow(sessionId, {
       step: 16,
-      title: 'MCP 接続成功 (tools/list)',
+      title: `MCP 接続成功 (server/discover → tools/list, MCP ${session.protocolVersion})`,
       detail: tools.map((t) => t.name).join(', '),
       level: 'ok',
     });
@@ -452,9 +597,11 @@ async function runChat(sessionId: string, prompt: string): Promise<void> {
       throw new Error(`MCP サーバーに ${call.name} ツールがありません`);
     }
 
+    // partner_hello では、この呼び出しの中で input_required (URL モード Elicitation) → ユーザーの同意
+    // → 再試行 (MRTR) が起こりうる。SDK がこれを 1 回の callTool の内側で処理する。
     const text = await mcp.callTool(session, call.name, call.arguments);
     flow(sessionId, {
-      step: 16,
+      step: isPartner ? '16 / E7' : 16,
       title: 'リソースアクセス (tools/call)',
       detail: text.split('\n')[0],
       level: 'ok',
@@ -484,6 +631,7 @@ app.post('/api/chat', (req, res) => {
   void runChat(sessionId, prompt).catch((err: Error) => {
     log.error(err.message);
     flow(sessionId, { title: 'エラー', detail: err.message, level: 'error' });
+    send(sessionId, 'authorization-done', {});
     send(sessionId, 'elicitation-done', {});
     send(sessionId, 'message', {
       role: 'assistant',
@@ -527,8 +675,8 @@ app.get('/api/config', (_req, res) => {
 
 app.use(express.static(path.join(import.meta.dirname, 'public')));
 
-app.listen(PROFILE.port, () => {
-  log.info(`オーケストレーター (${PROFILE.label}) を起動しました: ${PROFILE.base}`);
+app.listen(PROFILE.port, BIND_HOST, () => {
+  log.info(`オーケストレーター (${PROFILE.label}) を起動しました: ${PROFILE.base} (bind ${BIND_HOST})`);
   log.info(`CIMD (client_id): ${PROFILE.clientId}`);
   if (PROFILE.variant === 'untrusted') {
     log.warn('このクライアントは Client registry の許可リストに載っていません (認可は失敗します)');

@@ -4,6 +4,8 @@ const COLORS: Record<string, string> = {
   mcp: '\x1b[32m',
   llm: '\x1b[34m',
   orchestrator: '\x1b[36m',
+  'orchestrator!': '\x1b[31m',
+  partner: '\x1b[92m',
 };
 const RESET = '\x1b[0m';
 

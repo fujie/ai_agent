@@ -7,7 +7,7 @@
  * を返すだけ。オーケストレーターとは実際の HTTP でやり取りする。
  */
 import express from 'express';
-import { PORTS } from '../shared/config.js';
+import { BIND_HOST, PORTS } from '../shared/config.js';
 import { createLogger } from '../shared/log.js';
 
 const log = createLogger('llm');
@@ -35,7 +35,8 @@ function extractName(prompt: string): string | undefined {
   ];
   for (const re of patterns) {
     const m = prompt.match(re);
-    if (m?.[1]) return m[1].trim();
+    // 「パートナー経由で太郎さんに」のような前置きを落として名前だけにする
+    if (m?.[1]) return m[1].split(/経由で|から|で|の/).pop()!.trim();
   }
   return undefined;
 }
@@ -56,17 +57,19 @@ app.post('/v1/infer', (req, res) => {
     return;
   }
 
-  const hello = tools.find((t) => t.name === 'hello');
-  if (hello) {
+  // 「外部」「パートナー」への言及があれば外部サービス経由のツールを、そうでなければ hello を選ぶ
+  const wantsPartner = /外部|パートナー|partner/i.test(userPrompt);
+  const tool = tools.find((t) => t.name === (wantsPartner ? 'partner_hello' : 'hello'));
+  if (tool) {
     const name = extractName(userPrompt);
-    log.step(4, `MCP Server 呼び出し指示: hello(${name ?? '既定値'})`);
+    log.step(4, `MCP Server 呼び出し指示: ${tool.name}(${name ?? '既定値'})`);
     res.json({
       type: 'tool_call',
       tool_calls: [
         {
           id: `call_${Date.now().toString(36)}`,
           server: 'hello-mcp-server',
-          name: 'hello',
+          name: tool.name,
           arguments: name ? { name } : {},
         },
       ],
@@ -81,6 +84,6 @@ app.post('/v1/infer', (req, res) => {
   });
 });
 
-app.listen(PORTS.llm, () => {
+app.listen(PORTS.llm, BIND_HOST, () => {
   log.info(`ダミー LLM を起動しました: http://localhost:${PORTS.llm}/v1/infer`);
 });

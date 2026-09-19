@@ -1,0 +1,164 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1640 960" width="1640" height="960" font-family="'Hiragino Sans','Hiragino Kaku Gothic ProN','Noto Sans JP','Yu Gothic',sans-serif">
+  <title>MCP + OAuth 2.1 + CIMD + PRM デモ 構成図</title>
+  <style>
+    .box { fill: #185f7a; stroke: #0f3d4f; stroke-width: 2; }
+    .ext { fill: #2e7d4f; stroke: #1c5233; stroke-width: 2; }
+    .bt { fill: #ffffff; text-anchor: middle; }
+    .lbl { fill: #1f2328; font-size: 13px; }
+    .lblO { fill: #b4500b; font-size: 13px; }
+    .tag { fill: #1f2328; font-size: 12px; font-weight: 700; }
+    .a { stroke: #1f2328; stroke-width: 1.8; fill: none; marker-end: url(#ah); }
+    .a2 { stroke: #1f2328; stroke-width: 1.8; fill: none; marker-start: url(#ah); marker-end: url(#ah); }
+    .o { stroke: #c2560c; stroke-width: 2; fill: none; marker-end: url(#aho); }
+    .d { stroke: #5b6470; stroke-width: 1.6; fill: none; stroke-dasharray: 7 5; marker-end: url(#ahd); }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#c2560c"/>
+    </marker>
+    <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b6470"/>
+    </marker>
+  </defs>
+
+  <!-- 背景 (GitHub のダークモードでも読めるように) -->
+  <rect width="1640" height="960" fill="#ffffff"/>
+
+  <!-- ================= 凡例と元の図からの変更点 ================= -->
+  <rect x="30" y="30" width="400" height="330" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="50" y="62" font-size="17" font-weight="700" fill="#1f2328">構成図 (MCP 2026-07-28 版)</text>
+  <line x1="50" y1="96" x2="100" y2="96" class="a"/>
+  <text x="112" y="101" class="lbl">MCP の認可フロー (1〜16)</text>
+  <line x1="50" y1="124" x2="100" y2="124" class="o"/>
+  <text x="112" y="129" class="lbl">外部サービス連携 = URL モード Elicitation</text>
+  <text x="112" y="147" class="lbl">(E2〜E7。partner_hello ツール)</text>
+  <line x1="50" y1="172" x2="100" y2="172" class="d"/>
+  <text x="112" y="177" class="lbl">CIMD の取得 (AS 側が client_id の URL を読む)</text>
+  <text x="50" y="214" font-size="14" font-weight="700" fill="#1f2328">元の図からの変更</text>
+  <text x="50" y="240" class="lbl">・6〜8 は 10 の中で AS が行う (10a〜c)</text>
+  <text x="50" y="264" class="lbl">・12 は Elicitation ではなく「認可 URL の提示」</text>
+  <text x="50" y="288" class="lbl">・URL モード Elicitation は外部サービス連携で使う</text>
+  <text x="50" y="312" class="lbl">・5 と 16 は server/discover から始まる (initialize なし)</text>
+  <text x="50" y="336" class="lbl">・未登録のオーケストレーター (4001) は 10b で拒否</text>
+
+  <!-- ================= コンポーネント ================= -->
+  <!-- User -->
+  <circle cx="90" cy="470" r="55" class="box"/>
+  <text x="90" y="478" class="bt" font-size="22">User</text>
+
+  <!-- UI -->
+  <rect x="230" y="390" width="250" height="140" class="box"/>
+  <text x="355" y="452" class="bt" font-size="26">UI</text>
+  <text x="355" y="490" class="bt" font-size="21">(Chat UI)</text>
+
+  <!-- ブラウザ -->
+  <rect x="230" y="640" width="250" height="140" class="box"/>
+  <text x="355" y="720" class="bt" font-size="26">ブラウザ</text>
+
+  <!-- Authorization Server -->
+  <rect x="640" y="80" width="300" height="120" class="box"/>
+  <text x="790" y="130" class="bt" font-size="25">Authorization</text>
+  <text x="790" y="166" class="bt" font-size="25">Server</text>
+
+  <!-- Client registry (AS の台帳) -->
+  <rect x="1150" y="225" width="220" height="85" class="box"/>
+  <text x="1260" y="262" class="bt" font-size="20">Client registry</text>
+  <text x="1260" y="290" class="bt" font-size="14">(AS の台帳・信頼ポリシー)</text>
+
+  <!-- オーケストレーター -->
+  <rect x="640" y="380" width="300" height="180" class="box"/>
+  <text x="790" y="428" class="bt" font-size="24">オーケストレーター</text>
+  <text x="790" y="470" class="bt" font-size="21">(MCP Client /</text>
+  <text x="790" y="504" class="bt" font-size="21">OAuth Client)</text>
+  <text x="790" y="538" class="bt" font-size="13">CIMD をホスト</text>
+
+  <!-- MCP Server -->
+  <rect x="1240" y="380" width="290" height="180" class="box"/>
+  <text x="1385" y="438" class="bt" font-size="25">MCP Server</text>
+  <text x="1385" y="476" class="bt" font-size="20">(Resource Server)</text>
+  <text x="1385" y="516" class="bt" font-size="13">hello / partner_hello</text>
+
+  <!-- LLM -->
+  <rect x="640" y="720" width="300" height="110" class="box"/>
+  <text x="790" y="784" class="bt" font-size="25">LLM (ダミー)</text>
+
+  <!-- 外部サービス -->
+  <rect x="1240" y="720" width="290" height="110" class="ext"/>
+  <text x="1385" y="765" class="bt" font-size="21">Partner Greeting</text>
+  <text x="1385" y="798" class="bt" font-size="15">Service (外部サービス)</text>
+
+  <!-- ================= MCP の認可フロー (1〜16) ================= -->
+  <!-- 1 / 13 -->
+  <line x1="138" y1="440" x2="228" y2="440" class="a"/>
+  <text x="95" y="402" class="lbl">1. プロンプト指示</text>
+  <line x1="128" y1="509" x2="228" y2="690" class="a"/>
+  <text x="188" y="630" class="lbl" text-anchor="end">13. 認可</text>
+
+  <!-- 2 -->
+  <line x1="482" y1="420" x2="638" y2="420" class="a"/>
+  <text x="560" y="411" class="lbl" text-anchor="middle">2. 起動</text>
+
+  <!-- 12 / 14 (斜め) -->
+  <line x1="640" y1="520" x2="482" y2="665" class="a"/>
+  <text transform="translate(556 587) rotate(-42.5)" class="lbl" text-anchor="middle">12. 認可 URL の提示</text>
+  <line x1="482" y1="700" x2="640" y2="548" class="a"/>
+  <text transform="translate(573 637) rotate(-43.9)" class="lbl" text-anchor="middle">14. Callback (認可コード)</text>
+
+  <!-- 3 / 4 -->
+  <line x1="745" y1="562" x2="745" y2="718" class="a"/>
+  <text x="735" y="645" class="lbl" text-anchor="end">3. 推論指示</text>
+  <line x1="835" y1="718" x2="835" y2="562" class="a"/>
+  <text x="845" y="645" class="lbl">4. MCP Server 呼び出し指示</text>
+
+  <!-- 10 / 11 / 15 -->
+  <line x1="700" y1="378" x2="700" y2="202" class="a"/>
+  <line x1="760" y1="202" x2="760" y2="378" class="a"/>
+  <line x1="820" y1="376" x2="820" y2="204" class="a2"/>
+  <text x="706" y="238" class="tag">10</text>
+  <text x="766" y="238" class="tag">11</text>
+  <text x="826" y="238" class="tag">15</text>
+  <text x="688" y="262" class="lbl" text-anchor="end">10. 認可リクエスト (PAR)</text>
+  <text x="688" y="292" class="lbl" text-anchor="end">11. 認可 URL を指示 (request_uri)</text>
+  <text x="688" y="322" class="lbl" text-anchor="end">15. 認可コードとトークンを交換</text>
+
+  <!-- 10a〜c: AS ↔ Client registry / CIMD 取得 -->
+  <line x1="942" y1="150" x2="1148" y2="262" class="a"/>
+  <text x="952" y="128" class="lbl">10a〜c. CIMD 確認・信頼判定・登録</text>
+  <line x1="1148" y1="300" x2="945" y2="378" class="d"/>
+  <text x="960" y="300" class="lbl" fill="#5b6470">CIMD を取得</text>
+
+  <!-- オーケストレーター ↔ MCP Server -->
+  <line x1="942" y1="410" x2="1238" y2="410" class="a"/>
+  <text x="1090" y="403" class="lbl" text-anchor="middle">5. アクセス試行 → 401</text>
+  <line x1="1238" y1="445" x2="942" y2="445" class="a"/>
+  <text x="1090" y="438" class="lbl" text-anchor="middle">9. PRM 取得</text>
+  <line x1="942" y1="480" x2="1238" y2="480" class="a"/>
+  <text x="1090" y="473" class="lbl" text-anchor="middle">16. リソースアクセス (Bearer)</text>
+
+  <!-- ================= 外部サービス連携 (E2〜E7) ================= -->
+  <line x1="638" y1="465" x2="482" y2="465" class="o"/>
+  <text x="560" y="456" class="lblO" text-anchor="middle">E3. URL を提示・同意</text>
+
+  <line x1="1238" y1="515" x2="942" y2="515" class="o"/>
+  <text x="1090" y="508" class="lblO" text-anchor="middle">E2. URL モード Elicitation</text>
+  <line x1="942" y1="550" x2="1238" y2="550" class="o"/>
+  <text x="1090" y="543" class="lblO" text-anchor="middle">E4. 同意を添えて再試行 (MRTR)</text>
+
+  <!-- E5: 本人確認 (MCP Server → AS) -->
+  <path d="M1480,378 C1480,120 1100,20 944,92" class="o"/>
+  <text x="1120" y="58" class="lblO">E5. 本人確認 (openid・sub を照合)</text>
+
+  <!-- E6 / E7: MCP Server ↔ 外部サービス -->
+  <line x1="1385" y1="562" x2="1385" y2="718" class="o"/>
+  <text x="1375" y="640" class="lblO" text-anchor="end">E6. トークン取得</text>
+  <text x="1375" y="658" class="lblO" text-anchor="end">E7. API 呼び出し</text>
+
+  <!-- ブラウザからの連携操作 -->
+  <path d="M420,782 V895 H1440 V832" class="o"/>
+  <text x="620" y="887" class="lblO">E6. 外部サービスの同意画面で許可</text>
+  <path d="M300,782 V930 H1600 V470 H1532" class="o"/>
+  <text x="620" y="922" class="lblO">E5. 連携 URL を開く (MCP Server へ)</text>
+</svg>
